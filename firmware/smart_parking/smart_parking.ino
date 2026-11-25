@@ -1,6 +1,5 @@
 // SMART PARKING SYSTEM - ESP32 + Firebase (app integration)
 //
-// What is new compared to the standalone version:
 //  * Core 0 runs a cloud task that talks to Firebase Realtime Database over HTTPS,
 //    so slow network calls never freeze the LEDs, sensors or the gate servo (core 1).
 //  * App bookings are read from the cloud. A booked slot shows a STEADY yellow LED.
@@ -33,6 +32,25 @@ const uint32_t GRACE_SEC = 15 * 60;                        // ...and released th
 const uint32_t SOON_SEC = 60 * 60;                         // walk-ins avoid slots booked to start within this time
 const unsigned long RESERVE_TIMEOUT = 5UL * 60UL * 1000UL; // guided car must park within 5 min
 const bool WALKIN_GUIDE_BLINK = false;                     // true = also blink a guide LED for walk-ins (their slot is never a booked one)
+
+// ---------- EVENTS main loop -> cloud task (defined early so every function can see them) ----------
+enum
+{
+  EV_PARKED = 1,
+  EV_LEFT = 2,
+  EV_ARRIVAL_USED = 3
+};
+struct CloudEvent
+{
+  uint8_t type;
+  int idx;
+  char bid[28];
+  char uid[40];
+  uint32_t t0;
+  uint32_t t1;
+  int rate;
+  uint8_t tries;
+};
 
 // ---------- HARDWARE ----------
 WiFiServer server(80);
@@ -93,24 +111,6 @@ char cArrivalUid[40];
 char usedBid[28];
 volatile int cRate = 20; // Rs per hour (refreshed from /lot/ratePerHour)
 
-// ---------- EVENTS main loop -> cloud task ----------
-enum
-{
-  EV_PARKED = 1,
-  EV_LEFT = 2,
-  EV_ARRIVAL_USED = 3
-};
-struct CloudEvent
-{
-  uint8_t type;
-  int idx;
-  char bid[28];
-  char uid[40];
-  uint32_t t0;
-  uint32_t t1;
-  int rate;
-  uint8_t tries;
-};
 QueueHandle_t evq;
 
 void sendEvent(uint8_t type, int idx)
@@ -343,12 +343,16 @@ void closeGateFast() { moveGateTo(CLOSED); }
 WiFiClientSecure secureClient;
 HTTPClient http;
 
-String fbUrl(const String &path, const String &extra = "")
+String fbUrlExtra(const String &path, const String &extra)
 {
   return String(FB_HOST) + "/" + path + ".json?auth=" + FB_SECRET + extra;
 }
+String fbUrl(const String &path)
+{
+  return fbUrlExtra(path, "");
+}
 
-int fbRequest(const char *method, const String &url, const String &body, String *out = nullptr)
+int fbRequestOut(const char *method, const String &url, const String &body, String *out)
 {
   if (!http.begin(secureClient, url))
     return -1;
@@ -356,10 +360,15 @@ int fbRequest(const char *method, const String &url, const String &body, String 
   http.setTimeout(8000);
   http.addHeader("Content-Type", "application/json");
   int code = http.sendRequest(method, body);
+  Serial.printf("FB %s -> %d\n", method, code);
   if (out && code > 0)
     *out = http.getString();
   http.end();
   return code;
+}
+int fbRequest(const char *method, const String &url, const String &body)
+{
+  return fbRequestOut(method, url, body, nullptr);
 }
 bool ok(int c) { return c >= 200 && c < 300; }
 
@@ -405,17 +414,19 @@ bool handleEvent(CloudEvent &e)
       return false;
     fbRequest("DELETE", fbUrl("parked/" + n), "");
     fbRequest("PATCH", fbUrl("slots/" + n), "{\"occupied\":false}");
+
     if (e.bid[0])
-    {
       fbRequest("PATCH", fbUrl(String("bookings/") + e.bid),
                 String("{\"status\":\"completed\",\"checkOutSec\":") + e.t1 + "}");
-    }
+    // free the rest of the booked time window so others can book or park here
+    fbRequest("DELETE", fbUrl(String("slotBookings/") + n + "/" + e.bid), "");
   }
-  else if (e.type == EV_ARRIVAL_USED)
-  {
-    fbRequest("DELETE", fbUrl("gate/arrival"), "");
-  }
-  return true;
+}
+else if (e.type == EV_ARRIVAL_USED)
+{
+  fbRequest("DELETE", fbUrl("gate/arrival"), "");
+}
+return true;
 }
 
 void pollCloud()
@@ -427,7 +438,7 @@ void pollCloud()
   static int pollCount = 0;
 
   // lot rate (every ~30 polls)
-  if (pollCount++ % 30 == 0 && fbRequest("GET", fbUrl("lot/ratePerHour"), "", &body) == 200)
+  if (pollCount++ % 30 == 0 && fbRequestOut("GET", fbUrl("lot/ratePerHour"), "", &body) == 200)
   {
     int r = body.toInt();
     if (r > 0)
@@ -438,7 +449,7 @@ void pollCloud()
   bool hold[6] = {false}, soon[6] = {false};
   char bid[6][28] = {}, uid[6][40] = {};
   String q = String("&orderBy=%22endSec%22&startAt=") + now;
-  int code = fbRequest("GET", fbUrl("bookings", q), "", &body);
+  int code = fbRequestOut("GET", fbUrlExtra("bookings", q), "", &body);
   if (code != 200)
     return; // keep the last known state if the network hiccups
 
@@ -478,7 +489,7 @@ void pollCloud()
   int arrIdx = -1;
   char arrBid[28] = "", arrUid[40] = "";
   bool arrivalGone = false;
-  if (fbRequest("GET", fbUrl("gate/arrival"), "", &body) == 200)
+  if (fbRequestOut("GET", fbUrl("gate/arrival"), "", &body) == 200)
   {
     if (body == "null")
     {
@@ -523,7 +534,7 @@ void pollCloud()
 
 void cloudTask(void *)
 {
-  secureClient.setInsecure(); // no certificate pinning; fine for a project, see README
+  secureClient.setInsecure(); // no certificate pinning; fine for a project
   for (int i = 0; i < 6; i++)
   { // publish a clean starting state
     String n = String(slotNames[i]);
